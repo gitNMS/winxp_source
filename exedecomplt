@@ -1,0 +1,354 @@
+# How Executable Files Work (Windows XP / NT)
+
+This explains how `.exe` files work on Windows, from the binary format
+on disk to a running process in memory, based on the Windows NT architecture in Windows XP.
+
+---
+
+## 1. The PE (Portable Executable) Format
+
+Every `.exe` (and `.dll`, `.sys`, `.ocx`) on Windows uses the **PE format**.
+A PE file is a structured binary with headers, sections, and metadata that tells
+the OS loader exactly how to map the file into memory and start execution.
+
+### File Layout on Disk
+
+```
+Offset 0x00    ┌──────────────────────────┐
+               │   DOS Header (64 bytes)  │  <- IMAGE_DOS_HEADER
+               │   e_magic = "MZ" (0x5A4D)│
+               │   e_lfanew = offset to PE│
+               ├──────────────────────────┤
+               │   DOS Stub Program       │  <- "This program cannot be
+               │   (optional, ~100 bytes) │     run in DOS mode."
+               ├──────────────────────────┤
+e_lfanew ───►  │   PE Signature (4 bytes) │  <- "PE\0\0" (0x00004550)
+               ├──────────────────────────┤
+               │   COFF File Header       │  <- IMAGE_FILE_HEADER (20 bytes)
+               │   - Machine type (x86)   │
+               │   - NumberOfSections     │
+               │   - TimeDateStamp        │
+               │   - SizeOfOptionalHeader │
+               │   - Characteristics      │
+               ├──────────────────────────┤
+               │   Optional Header        │  <- IMAGE_OPTIONAL_HEADER (224 bytes for PE32)
+               │   - Magic (0x10B = PE32) │
+               │   - AddressOfEntryPoint  │
+               │   - ImageBase(0x00400000)|
+               │   - SectionAlignment     │
+               │   - FileAlignment        │
+               │   - SizeOfImage          │
+               │   - SizeOfHeaders        │
+               │   - Subsystem (GUI/CUI)  │
+               │   - DataDirectory[16]    │
+               ├──────────────────────────┤
+               │   Section Headers[]      │  <- IMAGE_SECTION_HEADER (40 bytes each)
+               │   .text  - code          │
+               │   .rdata - read-only data│
+               │   .data  - read/write data│
+               │   .rsrc  - resources     │
+               │   .reloc - relocations   │
+               ├──────────────────────────┤
+               │   Section Bodies         │  <- Raw data for each section,
+               │   (aligned to FileAlign.)│     padded to FileAlignment
+               └──────────────────────────┘
+```
+
+### Key Structures (from winnt.h)
+
+```c
+// The very first bytes of any PE file
+typedef struct _IMAGE_DOS_HEADER {
+    WORD  e_magic;      // 0x5A4D ("MZ") - Mark Zbikowski's initials
+    WORD  e_cblp;       // Bytes on last page of file
+    // ... (legacy DOS fields) ...
+    LONG  e_lfanew;     // Offset to IMAGE_NT_HEADERS (the PE header)
+} IMAGE_DOS_HEADER;
+
+// The main PE header, found at offset e_lfanew
+typedef struct _IMAGE_NT_HEADERS {
+    DWORD                 Signature;       // 0x00004550 ("PE\0\0")
+    IMAGE_FILE_HEADER     FileHeader;      // Machine, section count, etc.
+    IMAGE_OPTIONAL_HEADER OptionalHeader;  // Entry point, image base, etc.
+} IMAGE_NT_HEADERS;
+
+// Describes one section (.text, .data, etc.)
+typedef struct _IMAGE_SECTION_HEADER {
+    BYTE  Name[8];              // ".text", ".data", etc.
+    DWORD VirtualSize;          // Size in memory
+    DWORD VirtualAddress;       // RVA (Relative Virtual Address) when loaded
+    DWORD SizeOfRawData;        // Size on disk
+    DWORD PointerToRawData;     // File offset to raw data
+    DWORD Characteristics;      // Flags: readable, writable, executable
+} IMAGE_SECTION_HEADER;
+```
+
+### Data Directories
+
+The Optional Header contains an array of 16 **Data Directories**, each pointing
+to important metadata:
+
+| Index | Name                    | Purpose                                    |
+|-------|-------------------------|--------------------------------------------|
+| 0     | Export Table            | Functions exported by this module           |
+| 1     | **Import Table**        | DLLs and functions this module needs        |
+| 2     | Resource Table          | Icons, strings, dialogs, version info       |
+| 3     | Exception Table         | SEH exception handler data                  |
+| 4     | Certificate Table       | Authenticode digital signatures             |
+| 5     | **Base Relocation Table** | Fixups if loaded at non-preferred address |
+| 6     | Debug Directory         | Debug info (PDB path, checksum)             |
+| 12    | **IAT**                 | Import Address Table (resolved at load)     |
+
+---
+
+## 2. What Happens When You Double-Click an EXE
+
+### Step 1: Shell Invokes CreateProcess
+
+When you double-click `notepad.exe`, Explorer calls `CreateProcessW()` in
+**kernel32.dll**:
+
+```
+Explorer.exe
+  └─► kernel32!CreateProcessW("C:\WINDOWS\notepad.exe", ...)
+        └─► kernel32!CreateProcessInternalW(...)
+              └─► ntdll!NtCreateProcess(...)   // syscall into kernel
+```
+
+### Step 2: Kernel Creates the Process (ntos/ps/create.c)
+
+The NT kernel's Process Manager (`PspCreateProcess`) does the following:
+
+1. **Creates a new process object** (EPROCESS structure)
+2. **Creates a new address space** (new page directory)
+3. **Maps ntdll.dll** into the new process (every process gets ntdll)
+4. **Creates the initial thread** (ETHREAD structure)
+
+### Step 3: Memory Manager Maps the EXE (ntos/mm/)
+
+The Memory Manager creates a **section object** (memory-mapped file) for the
+executable:
+
+1. **Reads and validates the PE headers** - checks MZ signature, PE signature,
+   machine type, and header integrity
+2. **Creates a section for each PE section**:
+   - `.text` → mapped as `PAGE_EXECUTE_READ`
+   - `.rdata` → mapped as `PAGE_READONLY`
+   - `.data` → mapped as `PAGE_READWRITE` (copy-on-write)
+   - `.rsrc` → mapped as `PAGE_READONLY`
+3. **Preferred base address**: The exe requests loading at `ImageBase`
+   (typically `0x00400000` for executables). If that address is available
+   (it almost always is for .exe files), it loads there.
+4. **Demand paging**: Pages are NOT immediately read from disk. The memory
+   manager sets up page table entries that will fault-in pages on first access.
+
+```
+Virtual Address Space of new process:
+0x00000000  ┌─────────────────────┐
+            │ NULL page (guard)    │  Access violation if dereferenced
+0x00010000  ├─────────────────────┤
+            │ (available)          │
+0x00400000  ├─────────────────────┤
+            │ notepad.exe .text    │  Code (RX)
+            │ notepad.exe .rdata   │  Read-only data (R)
+            │ notepad.exe .data    │  Global variables (RW)
+            │ notepad.exe .rsrc    │  Resources (R)
+            ├─────────────────────┤
+            │ (available)          │
+0x7C800000  ├─────────────────────┤
+            │ kernel32.dll         │  (mapped later by loader)
+0x7C900000  ├─────────────────────┤
+            │ ntdll.dll            │  (mapped by kernel during create)
+            ├─────────────────────┤
+0x7FFE0000  │ SharedUserData       │  KUSER_SHARED_DATA (time, etc.)
+0x7FFFF000  │ (reserved)           │
+0x80000000  ├─────────────────────┤
+            │ Kernel space          │  Not accessible from user mode
+0xFFFFFFFF  └─────────────────────┘
+```
+
+### Step 4: NTDLL Loader Initializes (ntdll/ldrinit.c)
+
+The initial thread starts executing in `ntdll!LdrpInitialize`. This is the
+**user-mode PE loader** and it does the heavy lifting:
+
+#### 4a. Process the Import Table
+
+The import table lists every DLL the exe depends on:
+
+```
+notepad.exe Import Table:
+  ┌─────────────────────────────────────┐
+  │ DLL: KERNEL32.dll                   │
+  │   - CreateFileW                     │
+  │   - ReadFile                        │
+  │   - WriteFile                       │
+  │   - CloseHandle                     │
+  │   - ...                             │
+  ├─────────────────────────────────────┤
+  │ DLL: USER32.dll                     │
+  │   - CreateWindowExW                 │
+  │   - SendMessageW                    │
+  │   - DefWindowProcW                  │
+  │   - ...                             │
+  ├─────────────────────────────────────┤
+  │ DLL: GDI32.dll                      │
+  │   - TextOutW                        │
+  │   - SelectObject                    │
+  │   - ...                             │
+  └─────────────────────────────────────┘
+```
+
+For each imported DLL, the loader:
+
+1. **Searches for the DLL** using a defined search order:
+   - The directory containing the exe
+   - The system directory (`C:\WINDOWS\system32`)
+   - The Windows directory (`C:\WINDOWS`)
+   - The current directory
+   - Directories in the `PATH` environment variable
+
+2. **Maps the DLL** into the process address space (same PE mapping process)
+
+3. **Recursively resolves that DLL's imports** (DLLs can import from other DLLs)
+
+4. **Resolves function addresses** - For each imported function, looks up the
+   address in the DLL's **Export Table** and writes it into the exe's **Import
+   Address Table (IAT)**.
+
+```
+Before resolution:              After resolution:
+IAT[0] = "CreateFileW" (hint) → IAT[0] = 0x7C801A24 (actual address)
+IAT[1] = "ReadFile" (hint)    → IAT[1] = 0x7C801812 (actual address)
+```
+
+This is why calling `CreateFileW` in your code actually works - the compiler
+generates a call through the IAT: `call dword ptr [__imp__CreateFileW]`, which
+at runtime points to the real function in kernel32.dll.
+
+#### 4b. Apply Relocations (if needed)
+
+If a DLL couldn't load at its preferred `ImageBase` (because another DLL
+already occupies that address), the loader applies **base relocations**:
+
+- The relocation table lists every absolute address in the code/data
+- Each address is adjusted by the delta: `actual_base - preferred_base`
+- This is why `.reloc` sections exist
+
+Executables (.exe) almost never need relocation since they load first and
+`0x00400000` is almost always free.
+
+#### 4c. Run DLL Initializers
+
+For each loaded DLL, the loader calls its entry point (`DllMain`) with
+`DLL_PROCESS_ATTACH`. This is where DLLs initialize their internal state.
+
+The order is carefully managed - a DLL's dependencies are always initialized
+before the DLL itself (topological sort of the dependency graph).
+
+#### 4d. TLS (Thread Local Storage) Initialization
+
+If the exe or any DLL uses TLS (thread-local variables), the loader allocates
+TLS slots and runs TLS callbacks.
+
+### Step 5: Transfer to the Entry Point
+
+After all imports are resolved and DLLs initialized, the loader calls the
+exe's entry point. But it's NOT `main()` directly:
+
+```
+ntdll!LdrpInitialize
+  └─► kernel32!BaseProcessStartThunk
+        └─► kernel32!BaseProcessStart
+              └─► exe!WinMainCRTStartup     (or mainCRTStartup)
+                    ├─► CRT initialization    (C runtime setup)
+                    │   ├─► _heap_init()      (initialize heap)
+                    │   ├─► _cinit()          (C++ constructors, atexit)
+                    │   └─► _setenvp()        (environment)
+                    └─► exe!WinMain(...)      (YOUR code finally runs)
+```
+
+The `AddressOfEntryPoint` in the PE header points to the CRT startup function,
+not `main()`. The CRT startup:
+- Initializes the C/C++ runtime (heap, stdio, etc.)
+- Parses command-line arguments
+- Calls global C++ constructors
+- Finally calls your `main()` or `WinMain()`
+
+---
+
+## 3. How Code Actually Executes
+
+### The .text Section
+
+The `.text` section contains the compiled machine code. For x86 (Windows XP):
+
+```
+; A simple function call in x86 assembly:
+; Calling CreateFileW through the IAT
+push  0                          ; hTemplateFile
+push  FILE_ATTRIBUTE_NORMAL      ; dwFlagsAndAttributes
+push  OPEN_EXISTING              ; dwCreationDisposition
+push  0                          ; lpSecurityAttributes
+push  0                          ; dwShareMode
+push  GENERIC_READ               ; dwDesiredAccess
+push  offset szFileName          ; lpFileName
+call  dword ptr [__imp__CreateFileW]  ; indirect call through IAT
+; EAX now contains the file handle (or INVALID_HANDLE_VALUE)
+```
+
+The CPU executes these instructions sequentially. When `call` is executed:
+1. Push the return address onto the stack
+2. Jump to the target address (the real `CreateFileW` in kernel32.dll)
+3. kernel32 does its work, eventually making a syscall (`int 0x2e` or
+   `sysenter`) to transition to kernel mode
+4. The kernel performs the actual I/O operation
+5. Returns back to user mode → back to kernel32 → `ret` back to your code
+
+### System Calls
+
+When user-mode code needs kernel services (file I/O, memory allocation, etc.),
+it goes through ntdll.dll's system call stubs:
+
+```
+; ntdll!NtCreateFile (system call stub)
+mov   eax, 0x25          ; syscall number for NtCreateFile
+mov   edx, 0x7FFE0300    ; SystemCallStub pointer
+call  dword ptr [edx]    ; -> KiFastSystemCall (uses SYSENTER)
+ret   0x2C
+; KiFastSystemCall:
+mov   edx, esp
+sysenter                 ; transition to kernel mode
+```
+
+---
+
+## 4. Key Concepts Summary
+
+| Concept              | What It Means                                              |
+|----------------------|------------------------------------------------------------|
+| **PE Format**        | Binary container format for all Windows executables        |
+| **ImageBase**        | Preferred virtual address to load at (0x00400000 for exe)  |
+| **RVA**              | Relative Virtual Address - offset from ImageBase           |
+| **Import Table**     | List of DLLs and functions the exe needs                   |
+| **IAT**              | Array of function pointers, filled in at load time         |
+| **Export Table**     | Functions a DLL makes available to others                  |
+| **Base Relocation**  | Fixup table for when DLL loads at non-preferred address    |
+| **Section**          | Named block with specific memory permissions               |
+| **Entry Point**      | First instruction to execute (CRT startup, not main)       |
+| **Demand Paging**    | Pages loaded from disk only when first accessed            |
+
+## 5. Where This Lives in the Windows XP Source Tree
+
+| Component                | Source Location                              |
+|--------------------------|----------------------------------------------|
+| PE format definitions    | `public/sdk/inc/winnt.h` (IMAGE_* structs)   |
+| PE format extensions     | `public/sdk/inc/ntimage.h`                   |
+| User-mode loader         | `base/ntdll/ldrapi.c`, `ldrinit.c`           |
+| Kernel process creation  | `ntos/ps/create.c` (PspCreateProcess)        |
+| Kernel image mapping     | `ntos/mm/createse.c`, `ntos/mm/mapview.c`    |
+| PE validation            | `ntos/mm/imagemap.c`                         |
+| kernel32 CreateProcess   | `base/win32/client/process.c`                |
+| CRT startup              | `crt/src/crt0.c` (mainCRTStartup)            |
+| System call dispatch     | `ntos/ke/i386/trap.asm` (KiSystemService)    |
+| DLL search path logic    | `base/ntdll/ldrsearch.c`                     |
